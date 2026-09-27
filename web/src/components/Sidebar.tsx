@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { LayoutDashboard, Video, Settings, History, Wrench, Share2, Layers, Sparkles, Bot, Scissors, Film, MonitorPlay, Clapperboard } from "lucide-react";
+import { LayoutDashboard, Video, Settings, History, Wrench, Share2, Layers, Sparkles, Bot, Scissors, Film, MonitorPlay, Clapperboard, BrainCircuit } from "lucide-react";
 
 export function Sidebar() {
   const pathname = usePathname();
@@ -15,6 +15,7 @@ export function Sidebar() {
     { name: "Magic Clipper", href: "/clipper", icon: Scissors },
     { name: "Director Mode", href: "/director", icon: Film },
     { name: "Movie Explainer", href: "/explainer", icon: Clapperboard },
+    { name: "Scenario Engine", href: "/scenario", icon: BrainCircuit },
     { name: "Brand Assets", href: "/brand", icon: Layers },
     { name: "History & Projects", href: "/history", icon: History },
     { name: "Video Tools", href: "/tools", icon: Wrench },

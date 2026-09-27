@@ -14,6 +14,8 @@ websockets==12.0
 ffmpeg-python==0.2.0
 pillow
 requests
-opencv-python
+opencv-python<5
 numpy
 playwright
+google-auth-oauthlib
+google-api-python-client

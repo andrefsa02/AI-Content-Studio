@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { Film, Upload, CheckCircle2, Play, MonitorPlay, FileText, Loader2, Tag, Info, Youtube, Instagram, Smartphone } from "lucide-react";
+import { Film, Upload, CheckCircle2, Play, MonitorPlay, FileText, Loader2, Tag, Info, Smartphone } from "lucide-react";
 
 export default function PublishPage() {
   const [projects, setProjects] = useState<any[]>([]);
@@ -186,7 +186,7 @@ export default function PublishPage() {
                    </label>
                    <div className="grid grid-cols-3 gap-3">
                       <button type="button" onClick={() => setSelectedPlatforms(p => ({...p, youtube: !p.youtube}))} className={`flex flex-col items-center gap-2 p-3 rounded-lg border ${selectedPlatforms.youtube ? 'bg-red-500/20 border-red-500/50 text-white' : 'bg-white/5 border-white/10 text-zinc-500 hover:bg-white/10'}`}>
-                         <Youtube className="h-6 w-6" />
+                         <MonitorPlay className="h-6 w-6" />
                          <span className="text-[10px] font-bold">YouTube</span>
                          {socialStatus.youtube ? <span className="text-[8px] text-emerald-400 bg-emerald-500/20 px-1.5 rounded-sm">Connected</span> : <span className="text-[8px] text-zinc-500">Not Connected</span>}
                       </button>
@@ -196,7 +196,7 @@ export default function PublishPage() {
                          {socialStatus.tiktok ? <span className="text-[8px] text-emerald-400 bg-emerald-500/20 px-1.5 rounded-sm">Connected</span> : <span className="text-[8px] text-zinc-500">Not Connected</span>}
                       </button>
                       <button type="button" onClick={() => setSelectedPlatforms(p => ({...p, instagram: !p.instagram}))} className={`flex flex-col items-center gap-2 p-3 rounded-lg border ${selectedPlatforms.instagram ? 'bg-pink-500/20 border-pink-500/50 text-white' : 'bg-white/5 border-white/10 text-zinc-500 hover:bg-white/10'}`}>
-                         <Instagram className="h-6 w-6" />
+                         <Smartphone className="h-6 w-6" />
                          <span className="text-[10px] font-bold">Instagram</span>
                          {socialStatus.instagram ? <span className="text-[8px] text-emerald-400 bg-emerald-500/20 px-1.5 rounded-sm">Connected</span> : <span className="text-[8px] text-zinc-500">Not Connected</span>}
                       </button>

@@ -4,6 +4,14 @@ import { useState, useEffect, useRef } from "react";
 import { MonitorPlay, Scissors, Loader2, Play, Download, Settings2, ScissorsSquare, Share2, CheckCircle2, Circle, Edit2, Upload } from "lucide-react";
 import TimelineEditor from "@/components/TimelineEditor";
 
+type GeneratedClip = {
+  title: string;
+  path: string;
+  seo_title?: string;
+  seo_description?: string;
+  seo_tags?: string;
+};
+
 export default function ClipperPage() {
   const [url, setUrl] = useState("");
   const [status, setStatus] = useState("idle"); // idle, processing, selection, completed, failed
@@ -11,7 +19,7 @@ export default function ClipperPage() {
   const [progress, setProgress] = useState(0);
   const [logMsg, setLogMsg] = useState("");
   const [logs, setLogs] = useState<{message: string, time: string}[]>([]);
-  const [clips, setClips] = useState<{title: string, path: string}[]>([]);
+  const [clips, setClips] = useState<GeneratedClip[]>([]);
   const [numClips, setNumClips] = useState(3);
   
   // Local File vs YouTube

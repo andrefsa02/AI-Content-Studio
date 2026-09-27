@@ -11,6 +11,7 @@ API client classes and the configuration module to customize its behavior.
 
 import os
 import re
+import math
 import time
 import json
 import logging
@@ -93,99 +94,246 @@ def mix_audio_with_music(podcast_path, music_path, output_path, music_volume_db=
         logging.error(f"❌ Error mixing audio: {e}")
         return podcast_path
 
+def _caption_display_word(word, emoji_words):
+    text = word["word"].strip().upper()
+    clean = re.sub(r"[^A-Z]", "", text)
+    if clean in emoji_words:
+        return f"{text} {emoji_words[clean]}"
+    return text
+
+
+def _estimate_caption_width(text: str) -> float:
+    width = 0.0
+    narrow = "ilI.,'`!|:;"
+    wide = "MW@#%&"
+    for char in text:
+        if char.isspace():
+            width += 0.3
+        elif char in narrow:
+            width += 0.32
+        elif char in wide:
+            width += 0.9
+        elif ord(char) > 0x2E7F:
+            width += 1.1
+        else:
+            width += 0.58
+    return width
+
+
+def _group_caption_words(
+    words,
+    emoji_words=None,
+    max_words_per_line=7,
+    max_lines=2,
+    max_chars_per_line=34,
+    max_estimated_width=30.0,
+    pause_threshold=0.65,
+):
+    """Group timed words into bounded lines without altering their timestamps."""
+    emoji_words = emoji_words or {}
+    groups = []
+    lines = []
+    current_line = []
+    previous_word = None
+
+    def finish_line():
+        nonlocal current_line
+        if current_line:
+            lines.append(current_line)
+            current_line = []
+
+    def finish_group():
+        nonlocal lines, current_line
+        finish_line()
+        if lines:
+            groups.append(lines)
+            lines = []
+
+    def ends_phrase(text):
+        text = text.rstrip('"\'”’)]}')
+        return text.endswith((",", ".", "?", "!", ":", ";"))
+
+    for word in words:
+        if not isinstance(word, dict) or not isinstance(word.get("word"), str):
+            continue
+        text = word["word"].strip()
+        try:
+            start = float(word["start"])
+            end = float(word["end"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if not text or not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            continue
+
+        if previous_word is not None:
+            pause = start - float(previous_word["end"])
+            if pause >= pause_threshold:
+                finish_group()
+
+        display = _caption_display_word(word, emoji_words)
+        candidate = " ".join(_caption_display_word(item, emoji_words) for item in current_line + [word])
+        exceeds_line = bool(current_line) and (
+            len(current_line) >= max_words_per_line
+            or len(candidate) > max_chars_per_line
+            or _estimate_caption_width(candidate) > max_estimated_width
+        )
+        if exceeds_line:
+            finish_line()
+            if len(lines) >= max_lines:
+                finish_group()
+
+        # Keep an unusually long token isolated rather than allowing libass to wrap it.
+        current_line.append(word)
+        previous_word = word
+        if (
+            len(display) > max_chars_per_line
+            or _estimate_caption_width(display) > max_estimated_width
+            or ends_phrase(text)
+        ):
+            finish_group()
+
+    finish_group()
+    return groups
+
+
+def generate_captions_from_timestamps(
+    word_timestamps,
+    captions_file,
+    style_opts: dict = None,
+    source_offset: float = 0.0,
+):
+    """Write ASS captions from existing word timestamps without running Whisper."""
+    style_opts = style_opts or {}
+    source_offset = float(source_offset)
+    if not math.isfinite(source_offset):
+        raise ValueError("source_offset must be finite")
+
+    timed_words = []
+    for word in word_timestamps:
+        if not isinstance(word, dict):
+            raise ValueError("word timestamps must contain dictionaries")
+        timed_word = dict(word)
+        if source_offset:
+            try:
+                start = float(word["start"])
+                end = float(word["end"])
+            except (KeyError, TypeError, ValueError, OverflowError) as error:
+                raise ValueError("word timestamps must contain numeric start and end values") from error
+            timed_word["start"] = max(0.0, start - source_offset)
+            timed_word["end"] = max(timed_word["start"], end - source_offset)
+        timed_words.append(timed_word)
+
+    if not captions_file:
+        return timed_words
+
+    subs = pysubs2.SSAFile()
+    clipper_layout = bool(style_opts.get("clipper_layout", False))
+    if clipper_layout:
+        subs.info["PlayResX"] = str(style_opts.get("playres_x", 720))
+        subs.info["PlayResY"] = str(style_opts.get("playres_y", 1280))
+        subs.info["WrapStyle"] = "2"
+    style = pysubs2.SSAStyle(
+        fontname=style_opts.get("fontname", "Arial Black"),
+        fontsize=style_opts.get("fontsize", 46),
+        primarycolor=style_opts.get("primarycolor", pysubs2.Color(255, 255, 0, 0)),
+        outlinecolor=style_opts.get("outlinecolor", pysubs2.Color(0, 0, 0, 0)),
+        backcolor=style_opts.get("backcolor", pysubs2.Color(0, 0, 0, 180)),
+        bold=style_opts.get("bold", True),
+        borderstyle=style_opts.get("borderstyle", 1),
+        outline=style_opts.get("outline", 3),
+        shadow=style_opts.get("shadow", 1),
+        alignment=style_opts.get("alignment", 2),
+        marginv=style_opts.get("marginv", 40),
+        marginl=style_opts.get("marginl", 20),
+        marginr=style_opts.get("marginr", 20),
+    )
+    subs.styles["Default"] = style
+
+    # Preserve the existing keyword emoji map and active-word color tags.
+    emojis = {
+        "MONEY": "💰", "CASH": "💰", "DOLLAR": "💰", "REVENUE": "💰", "MILLION": "💰", "BILLION": "💰",
+        "VIRAL": "🔥", "EXPLOSIVE": "🔥", "FIRE": "🔥",
+        "SECRET": "🤫", "HIDDEN": "🤫", "TRUTH": "🤫",
+        "CRAZY": "🤯", "INSANE": "🤯", "MIND": "🤯",
+        "TIME": "⏱️", "FAST": "⏱️", "QUICK": "⏱️",
+        "HACK": "🛠️", "WOW": "😲"
+    }
+
+    primary = style_opts.get("primarycolor", pysubs2.Color(0, 255, 255, 255))
+    active_color = f"{{\\c&H{primary.b:02X}{primary.g:02X}{primary.r:02X}&}}"
+    inactive_color = "{\\c&HFFFFFF&}"
+
+    if clipper_layout:
+        caption_groups = _group_caption_words(
+            timed_words,
+            emoji_words=emojis,
+            max_words_per_line=style_opts.get("max_words_per_line", 7),
+            max_lines=style_opts.get("max_lines", 2),
+            max_chars_per_line=style_opts.get("max_chars_per_line", 34),
+            max_estimated_width=style_opts.get("max_estimated_width", 30.0),
+            pause_threshold=style_opts.get("pause_threshold", 0.65),
+        )
+    else:
+        # Preserve the existing non-Clipper caption layout.
+        chunks = []
+        current_chunk = []
+        for word in timed_words:
+            raw = word['word'].strip().upper()
+            if not raw: continue
+            current_chunk.append(word)
+            if len(current_chunk) >= 4 or (word['end'] - word['start'] > 0.5):
+                chunks.append(current_chunk)
+                current_chunk = []
+        if current_chunk:
+            chunks.append(current_chunk)
+        caption_groups = [[chunk] for chunk in chunks]
+
+    for lines in caption_groups:
+        chunk = [word for line in lines for word in line]
+        for i, active_word in enumerate(chunk):
+            w_start_ms = int(active_word['start'] * 1000)
+            w_end_ms = int(active_word['end'] * 1000)
+
+            line_texts = []
+            word_index = 0
+            for line in lines:
+                line_parts = []
+                for word in line:
+                    part = _caption_display_word(word, emojis)
+                    if word_index == i:
+                        part = f"{active_color}{part}{{\\r}}"
+                    else:
+                        part = f"{inactive_color}{part}{{\\r}}"
+                    line_parts.append(part)
+                    word_index += 1
+                line_texts.append(" ".join(line_parts))
+
+            subs.append(pysubs2.SSAEvent(
+                start=pysubs2.make_time(ms=w_start_ms),
+                end=pysubs2.make_time(ms=w_end_ms),
+                text=r"\N".join(line_texts),
+                style="Default"
+            ))
+
+    subs.save(captions_file)
+    logging.info(f"Captions file saved: {captions_file} ({len(subs)} events)")
+    return timed_words
+
+
 def generate_captions(audio_file, captions_file, language: str, style_opts: dict = None):
     """Transcribes audio and generates a styled ASS caption file, returning word timestamps."""
     logging.info("Transcribing audio for captions (this may take a moment)...")
     try:
         model = whisper.load_model("base")
         result = model.transcribe(audio_file, word_timestamps=True, language=language)
-        
+
         all_word_timestamps = []
         for segment in result.get("segments", []):
             all_word_timestamps.extend(segment.get("words", []))
 
         logging.info(f"Whisper transcribed {len(all_word_timestamps)} words.")
-
         if captions_file:
-            style_opts = style_opts or {}
-            subs = pysubs2.SSAFile()
-            style = pysubs2.SSAStyle(
-                fontname=style_opts.get("fontname", "Arial Black"),
-                fontsize=style_opts.get("fontsize", 46),
-                primarycolor=style_opts.get("primarycolor", pysubs2.Color(255, 255, 0, 0)),
-                outlinecolor=style_opts.get("outlinecolor", pysubs2.Color(0, 0, 0, 0)),
-                backcolor=style_opts.get("backcolor", pysubs2.Color(0, 0, 0, 180)),
-                bold=style_opts.get("bold", True),
-                outline=style_opts.get("outline", 3),
-                shadow=style_opts.get("shadow", 1),
-                alignment=style_opts.get("alignment", 2),
-                marginv=style_opts.get("marginv", 40),
-                marginl=style_opts.get("marginl", 20),
-                marginr=style_opts.get("marginr", 20),
-            )
-            subs.styles["Default"] = style
-            
-            # Hormozi-style Dictionary
-            emojis = {
-                "MONEY": "💰", "CASH": "💰", "DOLLAR": "💰", "REVENUE": "💰", "MILLION": "💰", "BILLION": "💰",
-                "VIRAL": "🔥", "EXPLOSIVE": "🔥", "FIRE": "🔥",
-                "SECRET": "🤫", "HIDDEN": "🤫", "TRUTH": "🤫",
-                "CRAZY": "🤯", "INSANE": "🤯", "MIND": "🤯",
-                "TIME": "⏱️", "FAST": "⏱️", "QUICK": "⏱️",
-                "HACK": "🛠️", "WOW": "😲"
-            }
-            
-            primary = style_opts.get("primarycolor", pysubs2.Color(0, 255, 255, 255))
-            active_color = f"{{\\c&H{primary.b:02X}{primary.g:02X}{primary.r:02X}&}}"
-            inactive_color = "{\\c&HFFFFFF&}"
-            
-            # Group into lines of ~4 words
-            chunks = []
-            current_chunk = []
-            for word in all_word_timestamps:
-                raw = word['word'].strip().upper()
-                if not raw: continue
-                current_chunk.append(word)
-                # break chunk if 4 words reached or there is a pause > 0.5s
-                if len(current_chunk) >= 4 or (word['end'] - word['start'] > 0.5):
-                    chunks.append(current_chunk)
-                    current_chunk = []
-            if current_chunk:
-                chunks.append(current_chunk)
-                
-            for chunk in chunks:
-                for i, active_word in enumerate(chunk):
-                    w_start_ms = int(active_word['start'] * 1000)
-                    w_end_ms = int(active_word['end'] * 1000)
-                    
-                    line_parts = []
-                    for j, w in enumerate(chunk):
-                        raw_text = w['word'].strip().upper()
-                        clean = re.sub(r'[^A-Z]', '', raw_text)
-                        
-                        part = raw_text
-                        if clean in emojis:
-                            part = f"{part} {emojis[clean]}"
-                            
-                        if j == i:
-                            # Highlight active word
-                            part = f"{active_color}{part}{{\\r}}"
-                        else:
-                            # Inactive words are white
-                            part = f"{inactive_color}{part}{{\\r}}"
-                            
-                        line_parts.append(part)
-                        
-                    subs.append(pysubs2.SSAEvent(
-                        start=pysubs2.make_time(ms=w_start_ms),
-                        end=pysubs2.make_time(ms=w_end_ms),
-                        text=" ".join(line_parts),
-                        style="Default"
-                    ))
-                
-            subs.save(captions_file)
-            logging.info(f"Captions file saved: {captions_file} ({len(subs)} events)")
-            
+            generate_captions_from_timestamps(all_word_timestamps, captions_file, style_opts)
         return all_word_timestamps
     except Exception as e:
         logging.error(f"Whisper transcription failed: {e}", exc_info=True)

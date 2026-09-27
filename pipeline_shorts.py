@@ -2,15 +2,154 @@ import os
 import re
 import json
 import logging
+import math
 import subprocess
 import pysubs2
 import cv2
 import numpy as np
 import requests
 from server.core.youtube_downloader import download_youtube_video
-from pipeline import generate_captions
+from pipeline import generate_captions, generate_captions_from_timestamps
 from api_clients import GoogleClient
 from config import load_config
+
+
+_CLIPPER_FONT_FILES = {
+    "Arial": ("arial.ttf",),
+    "Impact": ("impact.ttf",),
+    "Roboto": ("Roboto-Regular.ttf", "Roboto.ttf"),
+    "Times New Roman": ("times.ttf",),
+}
+
+
+def _resolve_clipper_caption_font(configured_font: str, fonts_directory: str = None) -> str:
+    requested = (configured_font or "Arial").strip()
+    font_name = next(
+        (name for name in _CLIPPER_FONT_FILES if name.casefold() == requested.casefold()),
+        None,
+    )
+    if font_name is None:
+        return "Arial"
+
+    if fonts_directory is None:
+        fonts_directory = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+    if any(os.path.isfile(os.path.join(fonts_directory, filename)) for filename in _CLIPPER_FONT_FILES[font_name]):
+        return font_name
+    return "Arial"
+
+
+def _clipper_caption_style(config: dict) -> dict:
+    theme = config.get("CAPTION_THEME", "default")
+    if theme == "viral_yellow":
+        primarycolor = pysubs2.Color(255, 255, 0, 0)
+        backcolor = pysubs2.Color(0, 0, 0, 255)
+        outline = 2.0
+    elif theme == "neon_cyber":
+        primarycolor = pysubs2.Color(0, 255, 255, 0)
+        backcolor = pysubs2.Color(255, 0, 255, 100)
+        outline = 1.0
+    elif theme == "black_white":
+        primarycolor = pysubs2.Color(0, 0, 0, 0)
+        backcolor = pysubs2.Color(255, 255, 255, 255)
+        outline = 2.0
+    else:
+        primarycolor = pysubs2.Color(255, 255, 255, 0)
+        backcolor = pysubs2.Color(0, 0, 0, 150)
+        outline = 3.0
+
+    return {
+        "fontname": _resolve_clipper_caption_font(config.get("CAPTION_FONT", "Arial")),
+        "fontsize": 20,
+        "alignment": pysubs2.Alignment.BOTTOM_CENTER,
+        "marginv": 110,
+        "marginl": 24,
+        "marginr": 24,
+        "bold": True,
+        "borderstyle": 1,
+        "outline": outline,
+        "outlinecolor": pysubs2.Color(0, 0, 0, 0),
+        "shadow": 1,
+        "primarycolor": primarycolor,
+        "backcolor": backcolor,
+        "clipper_layout": True,
+        "playres_x": 720,
+        "playres_y": 1280,
+        "max_words_per_line": 7,
+        "max_lines": 2,
+        "max_chars_per_line": 34,
+        "max_estimated_width": 30.0,
+        "pause_threshold": 0.65,
+    }
+
+
+def _validate_word_timestamps(word_timestamps, source: str):
+    if not isinstance(word_timestamps, list) or not word_timestamps:
+        raise ValueError(f"Invalid Whisper timestamps in {source}: expected a non-empty JSON list")
+
+    for index, word in enumerate(word_timestamps):
+        if not isinstance(word, dict) or not isinstance(word.get("word"), str) or not word["word"].strip():
+            raise ValueError(f"Invalid Whisper timestamp at index {index} in {source}: missing word text")
+        try:
+            start = float(word["start"])
+            end = float(word["end"])
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            raise ValueError(f"Invalid Whisper timestamp at index {index} in {source}: invalid start/end") from error
+        if not math.isfinite(start) or not math.isfinite(end) or end < start:
+            raise ValueError(f"Invalid Whisper timestamp at index {index} in {source}: invalid start/end")
+    return word_timestamps
+
+
+def _persist_word_timestamps(output_dir: str, word_timestamps) -> str:
+    timestamp_path = os.path.join(output_dir, "word_timestamps.json")
+    with open(timestamp_path, "w", encoding="utf-8") as handle:
+        json.dump(word_timestamps, handle, ensure_ascii=False)
+        handle.flush()
+
+    with open(timestamp_path, "r", encoding="utf-8") as handle:
+        persisted = json.load(handle)
+    _validate_word_timestamps(persisted, timestamp_path)
+    if len(persisted) != len(word_timestamps) or persisted != word_timestamps:
+        raise IOError(f"Whisper timestamp verification failed for {timestamp_path}")
+
+    logging.info("Saved %d Whisper word timestamps to %s", len(persisted), timestamp_path)
+    return timestamp_path
+
+
+def _load_word_timestamps(output_dir: str):
+    timestamp_path = os.path.join(output_dir, "word_timestamps.json")
+    try:
+        with open(timestamp_path, "r", encoding="utf-8") as handle:
+            word_timestamps = json.load(handle)
+    except FileNotFoundError as error:
+        raise FileNotFoundError(
+            f"Cannot render Clipper job: persisted Whisper timestamps are missing: {timestamp_path}"
+        ) from error
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"Cannot render Clipper job: persisted Whisper timestamps are unreadable: {timestamp_path}"
+        ) from error
+    return _validate_word_timestamps(word_timestamps, timestamp_path)
+
+
+def _clip_local_word_timestamps(word_timestamps, clip_start: float, clip_end: float):
+    clip_start = float(clip_start)
+    clip_end = float(clip_end)
+    if not math.isfinite(clip_start) or not math.isfinite(clip_end) or clip_end <= clip_start:
+        raise ValueError(f"Invalid clip bounds: start={clip_start}, end={clip_end}")
+
+    clip_words = []
+    for word in word_timestamps:
+        word_start = float(word["start"])
+        word_end = float(word["end"])
+        if word_end <= clip_start or word_start >= clip_end:
+            continue
+
+        local_word = dict(word)
+        local_word["start"] = max(0.0, word_start - clip_start)
+        local_word["end"] = max(local_word["start"], word_end - clip_start)
+        clip_words.append(local_word)
+    return clip_words
+
 
 def fetch_b_roll_video(query: str, api_key: str, output_path: str) -> bool:
     if not api_key: return False
@@ -129,6 +268,8 @@ def analyze_video(source: str, is_local: bool, job_id: str, update_job_callback,
         
         if not word_timestamps:
             raise Exception("Transcription failed or returned no words.")
+
+        _persist_word_timestamps(output_dir, word_timestamps)
             
         # Build a transcript with timestamps so the LLM knows when things happen
         transcript_chunks = []
@@ -207,6 +348,9 @@ def render_youtube_clips(job_id: str, video_path: str, selected_clips: list, upd
         client = GoogleClient(config)
         output_dir = os.path.join("workspace", f"clipper_{job_id}")
         os.makedirs(output_dir, exist_ok=True)
+        # IMPORTANT: Render reuses Whisper timestamps from analysis.
+        # Do not retranscribe rendered clips here.
+        word_timestamps = _load_word_timestamps(output_dir)
         
         update_job_callback(job_id, step="Cropping & Captioning", progress=0.7)
         
@@ -275,39 +419,13 @@ def render_youtube_clips(job_id: str, video_path: str, selected_clips: list, upd
             except Exception as e:
                 logging.error(f"Audio Ducking failed for {clip_name}: {e}")
             
-            theme = config.get("CAPTION_THEME", "default")
-            font = config.get("CAPTION_FONT", "Arial")
-            font_size = int(config.get("CAPTION_FONT_SIZE", 22))
-            
-            if theme == "viral_yellow":
-                primarycolor = pysubs2.Color(255, 255, 0, 255)
-                backcolor = pysubs2.Color(0, 0, 0, 255)
-                outline = 2.0
-            elif theme == "neon_cyber":
-                primarycolor = pysubs2.Color(0, 255, 255, 255)
-                backcolor = pysubs2.Color(255, 0, 255, 100)
-                outline = 1.0
-            elif theme == "black_white":
-                primarycolor = pysubs2.Color(0, 0, 0, 255)
-                backcolor = pysubs2.Color(255, 255, 255, 255)
-                outline = 2.0
-            else:
-                primarycolor = pysubs2.Color(255, 255, 255, 255)
-                backcolor = pysubs2.Color(0, 0, 0, 150)
-                outline = 1.5
-
             ass_path = os.path.join(output_dir, f"{safe_title}.ass")
-            generate_captions(out_path, ass_path, "English", style_opts={
-                "fontname": font, 
-                "fontsize": font_size, 
-                "alignment": 2, 
-                "marginv": 60,
-                "bold": True,
-                "outline": outline,
-                "shadow": 1,
-                "primarycolor": primarycolor,
-                "backcolor": backcolor
-            })
+            clip_word_timestamps = _clip_local_word_timestamps(word_timestamps, start, end)
+            generate_captions_from_timestamps(
+                clip_word_timestamps,
+                ass_path,
+                style_opts=_clipper_caption_style(config),
+            )
             
             final_out_path = os.path.join(output_dir, f"Final_{clip_name}")
             subs_path = os.path.abspath(ass_path).replace('\\', '/').replace(':', '\\:')

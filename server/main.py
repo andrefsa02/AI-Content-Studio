@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from server.routers import generation
 from server.routers import generation, publish, tools, brand, studio, campaigns, clipper, director
+from server.routers import scenario
 
 # Ensure workspace dir exists
 os.makedirs("workspace", exist_ok=True)
@@ -34,6 +35,7 @@ app.add_middleware(
 
 # Include routers
 app.include_router(generation.router, prefix="/api/generate", tags=["Generation"])
+app.include_router(scenario.router, prefix="/api/scenarios", tags=["Scenarios"])
 
 from server.routers import clipper
 app.include_router(clipper.router, prefix="/api/clipper", tags=["Clipper"])

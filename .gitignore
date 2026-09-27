@@ -115,3 +115,5 @@ recover_tsx.py
 test_clipper.py
 package-lock.json
 login_videofx.py
+
+.venv311/

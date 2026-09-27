@@ -14,9 +14,15 @@ import json
 import logging
 from functools import wraps
 import re
+import threading
+from collections import deque
+from collections.abc import Mapping
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from google.api_core import exceptions as google_exceptions
+from google.protobuf.message import Message
 
 # Safely import Google Cloud libraries for Vertex AI
 try:
@@ -32,12 +38,252 @@ except ImportError:
 
 
 # --- API Constants (As specified by user) ---
-GEMINI_TEXT_MODEL = "gemini-2.5-flash"
+GEMINI_TEXT_MODEL = "gemini-3.8-flash"
 GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 WAVESPEED_POLL_URL = "https://api.wavespeed.ai/api/v3/predictions/{}/result"
 WAVESPEED_BASE_ENDPOINT = "https://api.wavespeed.ai/api/v3/{}"
 VEO_MODEL_ID = "veo-3.0-generate-preview" # For Vertex AI Video
 NANO_BANANA_IMAGE_MODEL = "gemini-2.5-flash-image-preview" # For Vertex AI Image
+GEMINI_TEXT_MODEL_FALLBACK_CHAIN = (
+    GEMINI_TEXT_MODEL,
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+)
+GEMINI_TEXT_MODEL_OPERATION_ALLOWLIST = {
+    "text": GEMINI_TEXT_MODEL_FALLBACK_CHAIN,
+    "json": GEMINI_TEXT_MODEL_FALLBACK_CHAIN,
+    "google_search": GEMINI_TEXT_MODEL_FALLBACK_CHAIN,
+}
+
+
+MODEL_DAILY_QUOTA = "MODEL_DAILY_QUOTA"
+MODEL_MINUTE_QUOTA = "MODEL_MINUTE_QUOTA"
+PROJECT_DAILY_QUOTA = "PROJECT_DAILY_QUOTA"
+PROJECT_MINUTE_QUOTA = "PROJECT_MINUTE_QUOTA"
+OTHER_RESOURCE_EXHAUSTED = "OTHER_RESOURCE_EXHAUSTED"
+NON_QUOTA_ERROR = "NON_QUOTA_ERROR"
+GEMINI_ALL_TEXT_MODELS_QUOTA_EXHAUSTED = "GEMINI_ALL_TEXT_MODELS_QUOTA_EXHAUSTED"
+
+
+class GeminiQuotaError(RuntimeError):
+    def __init__(self, category, error):
+        self.category = category
+        self.original_error = error
+        super().__init__(f"{category}: {error}")
+
+
+def _structured_error_values(value):
+    if value is None:
+        return []
+    if isinstance(value, Mapping):
+        values = []
+        for key, nested in value.items():
+            values.append(str(key))
+            values.extend(_structured_error_values(nested))
+        return values
+    if isinstance(value, (list, tuple)):
+        return [item for nested in value for item in _structured_error_values(nested)]
+    if isinstance(value, Message):
+        values = [str(value)]
+        for field, nested in value.ListFields():
+            values.append(field.name)
+            values.extend(_structured_error_values(nested))
+        return values
+    return [str(value)]
+
+
+def _error_evidence(error):
+    evidence = []
+    for attribute in ("message", "errors", "details", "metadata", "error_info"):
+        value = getattr(error, attribute, None)
+        if callable(value):
+            try:
+                value = value()
+            except Exception:
+                continue
+        evidence.extend(_structured_error_values(value))
+
+    response = getattr(error, "response", None)
+    if response is not None:
+        try:
+            payload = response.json()
+            if isinstance(payload, (Mapping, list, tuple, str, int, float)):
+                evidence.extend(_structured_error_values(payload))
+        except (ValueError, TypeError, AttributeError):
+            pass
+        evidence.extend(_structured_error_values(getattr(response, "text", None)))
+    evidence.append(str(error))
+    return " ".join(evidence).lower()
+
+
+def classify_gemini_error(error):
+    """Classify quota scope/cadence using structured provider details when present."""
+    response = getattr(error, "response", None)
+    status = getattr(error, "code", None) or getattr(response, "status_code", None)
+    is_resource_exhausted = isinstance(error, google_exceptions.ResourceExhausted)
+    if not is_resource_exhausted and status != 429:
+        return NON_QUOTA_ERROR
+
+    evidence = _error_evidence(error)
+    model_scope = bool(re.search(r"per[_ -]?model|model[_ -]?(?:id|name|dimension)|quota_dimensions.{0,120}model", evidence))
+    project_scope = bool(re.search(r"per[_ -]?project|project[_ -]?(?:id|number|dimension)|quota_dimensions.{0,120}project", evidence))
+    daily = bool(re.search(r"per[_ -]?(?:day|daily)|daily[_ -]?requests|requests[_ -]?per[_ -]?day|quota[_ -]?per[_ -]?day", evidence))
+    minute = bool(re.search(r"per[_ -]?(?:minute|min)|requests[_ -]?per[_ -]?(?:minute|min)|minute[_ -]?requests", evidence))
+
+    if model_scope and daily:
+        return MODEL_DAILY_QUOTA
+    if model_scope and minute:
+        return MODEL_MINUTE_QUOTA
+    if project_scope and daily:
+        return PROJECT_DAILY_QUOTA
+    if project_scope and minute:
+        return PROJECT_MINUTE_QUOTA
+    return OTHER_RESOURCE_EXHAUSTED
+
+
+class GeminiRequestDispatcher:
+    """FIFO, process-local limiter for Gemini API attempts and retries."""
+    def __init__(self, max_requests=4, window_seconds=60.0, max_attempts=5,
+                 retry_base_seconds=1.0, retry_max_seconds=60.0,
+                 clock=None, sleep=None):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.max_attempts = max_attempts
+        self.retry_base_seconds = retry_base_seconds
+        self.retry_max_seconds = retry_max_seconds
+        self._clock = clock or time.monotonic
+        self._sleep = sleep or time.sleep
+        self._condition = threading.Condition()
+        self._waiters = deque()
+        self._active = False
+        self._request_times = deque()
+
+    def dispatch(self, request):
+        ticket = object()
+        with self._condition:
+            self._waiters.append(ticket)
+            while self._waiters[0] is not ticket or self._active:
+                self._condition.wait()
+            self._waiters.popleft()
+            self._active = True
+
+        try:
+            for attempt in range(self.max_attempts):
+                self._wait_for_slot()
+                try:
+                    return request()
+                except Exception as error:
+                    category = classify_gemini_error(error)
+                    if category == MODEL_DAILY_QUOTA:
+                        raise GeminiQuotaError(category, error) from error
+                    if not self._is_rate_limit(error):
+                        raise
+                    if attempt + 1 >= self.max_attempts:
+                        if category in (PROJECT_DAILY_QUOTA, PROJECT_MINUTE_QUOTA):
+                            raise GeminiQuotaError(category, error) from error
+                        raise
+                    delay = self._provider_retry_delay(error)
+                    if delay is None:
+                        delay = min(self.retry_base_seconds * (2 ** attempt), self.retry_max_seconds)
+                    logging.warning(
+                        "Gemini rate limit reached; retrying in %.1f seconds (%d/%d).",
+                        delay, attempt + 1, self.max_attempts,
+                    )
+                    self._sleep(delay)
+        finally:
+            with self._condition:
+                self._active = False
+                self._condition.notify_all()
+
+    def _wait_for_slot(self):
+        while True:
+            now = self._clock()
+            while self._request_times and now - self._request_times[0] >= self.window_seconds:
+                self._request_times.popleft()
+            if len(self._request_times) < self.max_requests:
+                self._request_times.append(now)
+                return
+            self._sleep(max(0.0, self.window_seconds - (now - self._request_times[0])))
+
+    @staticmethod
+    def _is_rate_limit(error):
+        if isinstance(error, google_exceptions.ResourceExhausted):
+            return True
+        response = getattr(error, "response", None)
+        return isinstance(error, requests.exceptions.HTTPError) and getattr(response, "status_code", None) == 429
+
+    @staticmethod
+    def _provider_retry_delay(error):
+        structured_details = getattr(error, "details", ()) or ()
+        if callable(structured_details):
+            structured_details = structured_details()
+        response = getattr(error, "response", None)
+        if response is not None:
+            try:
+                payload = response.json()
+                structured_details = list(structured_details) + list(
+                    payload.get("error", {}).get("details", ())
+                )
+            except (ValueError, TypeError, AttributeError):
+                pass
+
+        for detail in structured_details:
+            if isinstance(detail, Mapping):
+                retry_delay = next(
+                    (value for key, value in detail.items() if key.lower().replace("_", "") == "retrydelay"),
+                    None,
+                )
+            else:
+                retry_delay = getattr(detail, "retry_delay", None)
+            if retry_delay is not None:
+                if isinstance(retry_delay, Mapping):
+                    seconds = retry_delay.get("seconds", 0)
+                    nanos = retry_delay.get("nanos", 0)
+                elif isinstance(retry_delay, str):
+                    match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*s\s*", retry_delay)
+                    if match:
+                        return float(match.group(1))
+                    continue
+                else:
+                    seconds = getattr(retry_delay, "seconds", 0)
+                    nanos = getattr(retry_delay, "nanos", 0)
+                try:
+                    return max(0.0, float(seconds) + float(nanos) / 1_000_000_000)
+                except (TypeError, ValueError):
+                    pass
+
+        headers = getattr(response, "headers", {}) or {}
+        retry_after = next((value for key, value in headers.items() if key.lower() == "retry-after"), None)
+        if retry_after is not None:
+            try:
+                return max(0.0, float(retry_after))
+            except (TypeError, ValueError):
+                try:
+                    retry_at = parsedate_to_datetime(str(retry_after))
+                    if retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=timezone.utc)
+                    return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+                except (TypeError, ValueError, OverflowError):
+                    pass
+
+        message = getattr(error, "message", None)
+        if callable(message):
+            message = message()
+        details = " ".join(str(value) for value in (message, error, getattr(response, "text", "")) if value)
+        patterns = (
+            r"Please retry in\s*([0-9]+(?:\.[0-9]+)?)\s*s",
+            r"retry[_ ]?delay[^0-9]{0,24}([0-9]+(?:\.[0-9]+)?)\s*s?",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, details, re.IGNORECASE)
+            if match:
+                return float(match.group(1))
+        return None
+
+
+# V1 is process-local. Multiple application processes need a shared limiter.
+gemini_request_dispatcher = GeminiRequestDispatcher()
 
 # --- Style Profiles: Single source of truth for all content styles ---
 STYLE_PROFILES = {
@@ -108,7 +354,30 @@ def get_style_profile(content_style: str) -> dict:
 
 
 def handle_api_errors(func):
-    """A decorator to catch and handle common API errors, with automatic rate-limit retries."""
+    """Format provider quota errors after retries have been handled by the dispatcher."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except google_exceptions.ResourceExhausted as e:
+            error_str = str(e.message) if hasattr(e, "message") else str(e)
+            if "aiplatform.googleapis.com" in error_str:
+                error_message = f"Vertex AI Quota Exceeded: {error_str}. Ensure your project region is set correctly in settings."
+            else:
+                error_message = f"Gemini API Quota Exceeded: {error_str}. Please check your usage or billing plan."
+            logging.error(error_message, exc_info=True)
+            raise RuntimeError(error_message) from e
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                error_message = "API rate limit heavily exceeded. Please wait manually and try again."
+                logging.error(error_message, exc_info=True)
+                raise RuntimeError(error_message) from e
+            raise
+    return wrapper
+
+
+def handle_vertex_api_errors(func):
+    """Preserve quota retries for Vertex calls, which are outside the Gemini dispatcher."""
     @wraps(func)
     def wrapper(*args, **kwargs):
         max_retries = 5
@@ -120,22 +389,16 @@ def handle_api_errors(func):
                 match = re.search(r"Please retry in ([0-9.]+)s", error_str)
                 if match and attempt < max_retries - 1:
                     wait_time = float(match.group(1)) + 1.5
-                    logging.warning(f"⏳ Rate limited by Google API. Auto-waiting {wait_time:.1f}s before retry ({attempt+1}/{max_retries})...")
                     time.sleep(wait_time)
                     continue
-                elif "aiplatform.googleapis.com" in error_str:
-                    error_message = f"Vertex AI Quota Exceeded: {error_str}. Ensure your project region is set correctly in settings."
-                else:
-                    error_message = f"Gemini API Quota Exceeded: {error_str}. Please check your usage or billing plan."
+                error_message = f"Vertex AI Quota Exceeded: {error_str}. Ensure your project region is set correctly in settings."
                 logging.error(error_message, exc_info=True)
                 raise RuntimeError(error_message) from e
             except requests.exceptions.HTTPError as e:
-                if e.response.status_code == 429 and attempt < max_retries - 1:
-                    wait_time = 30 * (attempt + 1)
-                    logging.warning(f"⏳ HTTP 429 Rate Limit. Auto-waiting {wait_time}s before retry ({attempt+1}/{max_retries})...")
-                    time.sleep(wait_time)
+                if e.response is not None and e.response.status_code == 429 and attempt < max_retries - 1:
+                    time.sleep(30 * (attempt + 1))
                     continue
-                elif e.response.status_code == 429:
+                if e.response is not None and e.response.status_code == 429:
                     error_message = "API rate limit heavily exceeded. Please wait manually and try again."
                     logging.error(error_message, exc_info=True)
                     raise RuntimeError(error_message) from e
@@ -173,6 +436,11 @@ class GoogleClient:
     def __init__(self, config):
         self.config = config
         self.api_key = config.get("GEMINI_API_KEY")
+        self.last_text_request = {
+            "requested_model": GEMINI_TEXT_MODEL,
+            "effective_model": None,
+            "fallback_used": False,
+        }
         if not self.api_key:
             logging.warning("Google API key is missing. Ensure Ollama or WaveSpeed is selected for text generation.")
         else:
@@ -184,6 +452,73 @@ class GoogleClient:
                 HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
             }
             self.text_model = genai.GenerativeModel(GEMINI_TEXT_MODEL, safety_settings=self.safety_settings)
+
+    def _text_models_for_operation(self, operation):
+        allowed = GEMINI_TEXT_MODEL_OPERATION_ALLOWLIST.get(operation, (GEMINI_TEXT_MODEL,))
+        return tuple(model for model in GEMINI_TEXT_MODEL_FALLBACK_CHAIN if model in allowed)
+
+    def _text_model_for(self, model_name):
+        if model_name == GEMINI_TEXT_MODEL:
+            return self.text_model
+        return genai.GenerativeModel(model_name, safety_settings=self.safety_settings)
+
+    def _route_text_request(self, task, operation, request_for_model):
+        models = self._text_models_for_operation(operation)
+        self.last_text_request = {
+            "requested_model": GEMINI_TEXT_MODEL,
+            "effective_model": None,
+            "fallback_used": False,
+        }
+        logging.info(
+            "[GEMINI ROUTER] task=%s primary_model=%s",
+            task, GEMINI_TEXT_MODEL,
+        )
+        attempted_model_quotas = []
+        last_error = None
+
+        for model_name in models:
+            try:
+                result = gemini_request_dispatcher.dispatch(
+                    lambda model_name=model_name: request_for_model(model_name)
+                )
+            except Exception as error:
+                last_error = error
+                category = error.category if isinstance(error, GeminiQuotaError) else classify_gemini_error(error)
+                if category in (PROJECT_DAILY_QUOTA, PROJECT_MINUTE_QUOTA):
+                    logging.error(
+                        "[GEMINI ROUTER] model=%s result=PROJECT_QUOTA_EXHAUSTED quota=%s",
+                        model_name, category,
+                    )
+                    raise RuntimeError(f"GEMINI_PROJECT_QUOTA_EXHAUSTED: {category}") from error
+
+                if category in (MODEL_DAILY_QUOTA, MODEL_MINUTE_QUOTA):
+                    attempted_model_quotas.append((model_name, category))
+                    logging.warning(
+                        "[GEMINI ROUTER] model=%s result=QUOTA_EXHAUSTED quota=%s",
+                        model_name, category,
+                    )
+                    if model_name != models[-1]:
+                        next_model = models[models.index(model_name) + 1]
+                        logging.info(
+                            "[GEMINI ROUTER] fallback %s -> %s",
+                            model_name, next_model,
+                        )
+                        continue
+                    break
+                raise
+
+            self.last_text_request = {
+                "requested_model": GEMINI_TEXT_MODEL,
+                "effective_model": model_name,
+                "fallback_used": model_name != GEMINI_TEXT_MODEL,
+            }
+            logging.info("[GEMINI ROUTER] model=%s result=SUCCESS", model_name)
+            return result
+
+        if len(models) == len(GEMINI_TEXT_MODEL_FALLBACK_CHAIN) and len(attempted_model_quotas) == len(models):
+            raise RuntimeError(GEMINI_ALL_TEXT_MODELS_QUOTA_EXHAUSTED) from last_error
+        category = attempted_model_quotas[-1][1] if attempted_model_quotas else OTHER_RESOURCE_EXHAUSTED
+        raise RuntimeError(f"GEMINI_TEXT_MODEL_QUOTA_EXHAUSTED: {category}") from last_error
 
     def _generate_text(self, prompt: str, as_json=False) -> str:
         """Dynamically routes text generation to Gemini, WaveSpeed, or Ollama."""
@@ -237,9 +572,15 @@ class GoogleClient:
                     
         else: # Gemini API
             if not hasattr(self, 'text_model'): raise RuntimeError("Gemini API key not configured properly.")
-            kwargs = {}
-            if as_json: kwargs["generation_config"] = {"response_mime_type": "application/json"}
-            response = self.text_model.generate_content(prompt, **kwargs)
+            operation = "json" if as_json else "text"
+
+            def generate_for_model(model_name):
+                kwargs = {"request_options": {"retry": None}}
+                if as_json:
+                    kwargs["generation_config"] = {"response_mime_type": "application/json"}
+                return self._text_model_for(model_name).generate_content(prompt, **kwargs)
+
+            response = self._route_text_request("text_generation", operation, generate_for_model)
             return response.text
 
     @handle_api_errors
@@ -265,17 +606,27 @@ class GoogleClient:
         
         if engine == "Gemini API":
             logging.info("Using Gemini native Google Search for single-pass research...")
-            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_TEXT_MODEL}:generateContent?key={self.api_key}"
             payload = {"contents": [{"parts": [{"text": prompt}]}], "tools": [{"google_search": {}}]}
             try:
-                response = requests.post(api_url, json=payload, timeout=120)
-                response.raise_for_status()
+                def research_with_model(model_name):
+                    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={self.api_key}"
+
+                    def send_request():
+                        response = requests.post(api_url, json=payload, timeout=120)
+                        response.raise_for_status()
+                        return response
+
+                    return send_request()
+
+                response = self._route_text_request("deep_research", "google_search", research_with_model)
                 response_json = response.json()
                 summary = response_json.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text")
                 if not summary: raise ValueError("No text content found in Gemini research.")
                 return summary
             except requests.exceptions.HTTPError:
                 raise # Let the @handle_api_errors wrapper manage retries
+            except RuntimeError:
+                raise
             except Exception as e:
                 logging.error(f"Failed during Research: {e}")
                 raise RuntimeError(f"Failed research: {e}")
@@ -531,7 +882,9 @@ Generate the complete script now, ensuring all vocal directions match the '{cont
     def gemini_nanobanana_image(self, prompt: str, output_path: str):
         logging.info(f"Generating image with Gemini API (gemini-2.5-flash-image-preview): '{prompt}'")
         model = genai.GenerativeModel(NANO_BANANA_IMAGE_MODEL, safety_settings=self.safety_settings)
-        response = model.generate_content(prompt)
+        response = gemini_request_dispatcher.dispatch(
+            lambda: model.generate_content(prompt, request_options={"retry": None})
+        )
         
         image_part = response.candidates[0].content.parts[0]
         if "image" not in image_part.mime_type:
@@ -542,7 +895,7 @@ Generate the complete script now, ensuring all vocal directions match the '{cont
             f.write(base64.b64decode(image_data))
         logging.info(f"Image successfully saved to {output_path}")
 
-    @handle_api_errors
+    @handle_vertex_api_errors
     def vertex_nanobanana_image(self, prompt: str, output_path: str):
         if not vertexai or not ImageGenerationModel:
             raise RuntimeError("Vertex AI libraries not installed correctly.")
@@ -639,8 +992,12 @@ Generate the complete script now, ensuring all vocal directions match the '{cont
                  payload["generationConfig"]["speechConfig"] = {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": tts_config.get("SPEAKER1", "Kore")}}}
 
             
-            response = requests.post(api_url, json=payload, timeout=300)
-            response.raise_for_status()
+            def send_request():
+                response = requests.post(api_url, json=payload, timeout=300)
+                response.raise_for_status()
+                return response
+
+            response = gemini_request_dispatcher.dispatch(send_request)
             resp_json = response.json()
             candidates = resp_json.get("candidates", [])
             if not candidates: raise RuntimeError(f"TTS failed: No candidates in response. {resp_json}")
@@ -693,7 +1050,7 @@ Generate the final video prompt now.
         return self._generate_text(prompt).strip().replace('"', '')
 
 
-    @handle_api_errors
+    @handle_vertex_api_errors
     def vertex_ai_text_to_video(self, prompt: str, output_path: str, aspect_ratio: str):
         if not vertexai: 
             raise RuntimeError("Vertex AI libraries not installed correctly.")
